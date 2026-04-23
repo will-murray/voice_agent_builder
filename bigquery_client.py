@@ -1,33 +1,19 @@
 """
 BigQuery client for pulling receptionist config and tool definitions.
-Authenticates using the GCS_SERVICE_ACCOUNT JSON from .env.
+Uses Application Default Credentials (ADC).
 """
 
-import json
 import os
 from google.cloud import bigquery
-from google.oauth2 import service_account
-from dotenv import load_dotenv
-
-load_dotenv()
 
 _client: bigquery.Client | None = None
 
 
 def get_client() -> bigquery.Client:
-    """Return a cached BigQuery client authenticated via service account."""
+    """Return a cached BigQuery client using ADC."""
     global _client
     if _client is None:
-        sa_json = os.environ["GCS_SERVICE_ACCOUNT"]
-        sa_info = json.loads(sa_json)
-        credentials = service_account.Credentials.from_service_account_info(
-            sa_info,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
-        _client = bigquery.Client(
-            project=os.environ["GCP_PROJECT"],
-            credentials=credentials,
-        )
+        _client = bigquery.Client(project=os.environ["GCP_PROJECT"])
     return _client
 
 

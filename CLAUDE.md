@@ -1,5 +1,40 @@
 # voice_agent_builder — AI Voice Agent Builder
 
+## Agent Specification
+
+### Data Model
+
+#### Identifiers:
+ - clinic_id - each voice agent is specific to a particular clinic with a clinic ID.
+-  instance_id - voice agents are associated with an instance ID to pull from info that is applicable to multiple
+
+#### Data Sources:
+- ClinicData.faq: linked to clinic_id, data is in question and answer columns. These are included in the knowledge base subject to approval (voice_assitant boolean column)
+- Users.clinics: clinic name, address, hours (monday - sunday)
+- ClinicData.scripts: This contains a script of information
+    - Scope of Practice
+    - Caller Needs
+    - Services
+    - Not Offered
+
+
+#### Main Objective
+
+You are a friendly receptionist, your job is to identify the needs of a caller, collect their information and set them up as best as possible for the clinic to work with them. All steps should be done politely and professionally. Be empathic if patients express frustration or distress about their hearing situation, your job is to help them.
+
+
+#### Script
+ 
+- Determine the callers needs
+- Determine what the callers requires (Scope of Practice)
+- Use the Services and Not Offered information: If the caller is not in scope ensure they are appropriate information
+- Collect the necessary information given the Caller’s Objective
+- Passing of the Call to the clinic
+- Possible hand offs:
+- Transfer to number
+- Inform the caller 
+
+
 ## Overview
 
 Creates and manages VAPI AI voice receptionists for audiology clinics. Voice agents are opt-in per clinic. The agent handles inbound calls that the clinic's receptionist did not answer (forwarded on no-answer from the clinic's primary phone system) and outbound calls for appointment confirmations and patient reactivation.
@@ -162,3 +197,5 @@ TWILIO_ACCOUNT_SID=     # PLANNED
 TWILIO_AUTH_TOKEN=      # PLANNED
 BLUEPRINT_API_KEY=      # Per-clinic — stored in cortex-hypervisor, passed at runtime
 ```
+
+
