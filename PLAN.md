@@ -91,6 +91,68 @@ Section editing + approval UI via `/dashboard/manage/[instanceId]` → **Scripts
 
 ---
 
+## Phase 6 — Per-clinic capabilities (configurable tool/protocol bundles) ✅ IMPLEMENTED
+
+The shape the user landed on: two feeds into the agent prompt.
+  1. **Knowledge Base** — clinic-specific, compiled via transcripts (Phases 1 + 5).
+  2. **Booking Protocols** — composed from per-clinic *capabilities*, each
+     bundling a VAPI tool + prompt fragment + PMS compatibility requirement.
+     Capabilities are toggled by admins in the dashboard.
+
+Multi-PMS abstraction: each `Capability` subclass carries a `supported_pms`
+tuple, and `to_vapi_tool()` branches on `self.pms_type` to pick the right
+URL. The hypervisor keeps its existing PMS-specific routers (`/blueprint/*`,
+future `/audit_data/*`); no generic dispatch layer. PHI isolation tests on
+`/blueprint/patient/match` remain valid (URL unchanged).
+
+- **6.1** ✅ Migration `005_clinic_voice_agent_capabilities.sql` —
+  mutable `Users.clinic_voice_agent_capabilities (clinic_id, capability_id,
+  enabled, config, updated_at, updated_by)`. PK at app layer. Backfill flips
+  `patient_match` + `search_availability` on for every existing `pms_type='blueprint'`
+  clinic to preserve prior behavior.
+- **6.2** ✅ `voice_agent_builder/capabilities.py` — `Capability` base class,
+  `SubmitTicket` (always-on, PMS-agnostic), `PatientMatch` and
+  `SearchAvailability` (Blueprint-only). Each `__init__` binds clinic context
+  + VAPI credential ID and validates PMS support. Tool JSON + prompt fragment
+  live on the class. `tools/blueprint.py` deleted.
+- **6.3** ✅ `agent_factory.build_agent_config(clinic, faqs, script_sections,
+  enabled_capability_ids)` — instantiates capabilities in registry order
+  (toggleable first, always-on last), composes tools + prompt fragments.
+  Booking Protocols layout: toggleable fragments → static Information Capture →
+  always-on fragments (Closing & Ticket Submission).
+- **6.4** ✅ `create_agent.fetch_enabled_capabilities(clinic_id)` reads BQ,
+  filters against `CAPABILITY_REGISTRY`. `sync_assistant` passes the list in.
+- **6.5** ✅ Hypervisor: `services/voice_agent_capabilities.py` mirrors the
+  metadata (3 fields per cap; documented as must-stay-in-sync). `voice_agent.py`
+  router gains `GET /clinics/{id}/voice_agent/capabilities` and
+  `PUT /clinics/{id}/voice_agent/capabilities/{capability_id}`. PUT uses BQ
+  MERGE for upsert; validates `supported_pms` against clinic's `pms_type`;
+  refuses always-on toggles; gates on `require_write_access`.
+- **6.6** ✅ Dashboard: new **Voice Agent** tab in `/dashboard/manage/[instanceId]`.
+  `VoiceAgentTab.tsx` renders one card per clinic with toggle switches.
+  Capabilities whose `supported_pms` doesn't include the clinic's `pms_type`
+  appear disabled with a "Requires: ..." badge. API routes:
+  - `GET /api/admin/instances/[id]/voice_agent_capabilities` — aggregated list
+  - `PUT /api/admin/clinics/[id]/voice_agent/capabilities/[capabilityId]` — toggle
+  `src/lib/voice_agent_capabilities.ts` is the third mirror (the must-stay-in-sync
+  list from Python lives here too).
+
+**Three copies of capability metadata** — `voice_agent_builder/capabilities.py`
+(canonical), `cortex-hypervisor/services/voice_agent_capabilities.py`,
+`cortex/src/lib/voice_agent_capabilities.ts`. Tolerable because:
+  - the metadata is 3 fields × few capabilities,
+  - each service has distinct consumers (tool build / toggle validation /
+    dashboard render) and can't share code easily,
+  - drift is immediately visible (enable a cap → if mirrors disagree, the tool
+    won't appear or the toggle will 400).
+
+**Audit Data Manage path** (when it lands): create `api/routers/audit_data.py`
+on the hypervisor with equivalent endpoints; extend each capability's
+`supported_pms` to include `"audit_data"`; extend `_tool_url` to branch. No
+changes to the dashboard or the capability toggle schema.
+
+---
+
 ## Cross-cutting notes
 
 - **Rollout**: the 4-of-4 gate means every clinic with an active agent today must have its compiled script backfilled and super-admin-approved *before* Phase 3 deploy — otherwise `sync_assistant` refuses and the agent can't be updated. Complete 1.2 and mass-approve before rolling Phase 3 out.

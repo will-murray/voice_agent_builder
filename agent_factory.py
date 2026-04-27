@@ -7,29 +7,37 @@ Reads:
 - Approved script sections — from Users.agent_script_sections (latest approved
   row per section; all four required: scope_of_practice, not_offered,
   callers_needs, protocols)
+- Enabled capability IDs — from Users.clinic_voice_agent_capabilities
 
-Tool set depends on clinic.pms_type:
-- "blueprint" → [match_patient_by_name, submit_ticket]
-- other       → [submit_ticket] only (no PHI source available for matching)
+Capabilities (see capabilities.py) bundle a VAPI tool + prompt fragment +
+PMS compatibility. SubmitTicket is always-on; PatientMatch and
+SearchAvailability are toggleable per-clinic via the dashboard.
 
 See voice_agent_builder/CLAUDE.md "Agent Specification" for the full contract.
 
 Usage:
-    config = build_agent_config(clinic, faqs, script_sections)
+    config = build_agent_config(clinic, faqs, script_sections, enabled_capability_ids)
     assistant = client.assistants.create(**config)
 """
+from __future__ import annotations
+
 import datetime
 import json
+import logging
 import os
 
 from secrets import get_secret
-from tools.blueprint import (
-    make_match_patient_tool,
-    make_submit_ticket_tool,
-)
+from capabilities import CAPABILITY_REGISTRY, Capability, SubmitTicket
+
+log = logging.getLogger(__name__)
 
 _CORTEX_BASE = os.environ.get("CORTEX_API_BASE_URL", "http://localhost:8000")
 _VAPI_SECRET = get_secret("vapi-webhook-secret")
+# VAPI `apiRequest` tools don't inherit the assistant's server secret — they
+# authenticate via a VAPI `credentialId` that references a custom-credential
+# configured to send `X-Vapi-Secret: <value>`. This credential is created
+# once per VAPI org (see README / setup notes) and its ID is stored in SM.
+_VAPI_CREDENTIAL_ID = get_secret("vapi-cortex-credential-id")
 
 SECTION_ORDER = [
     ("scope_of_practice", "Scope of Practice"),
@@ -37,6 +45,16 @@ SECTION_ORDER = [
     ("callers_needs", "Caller's Needs"),
     ("protocols", "Protocols"),
 ]
+
+# Universal Information-Capture guidance. Not tied to any single capability —
+# every call, regardless of toggles, needs this framing.
+_INFORMATION_CAPTURE_FRAGMENT = """## Information Capture
+Based on the caller's intent (cross-reference the Caller's Needs section of the Knowledge Base), collect at minimum:
+- Caller's name (as spoken).
+- Callback phone number.
+- Reason for the call (in the caller's words).
+- For appointment requests: preferred day(s) and time window, new-vs-existing patient status.
+- Any relevant clinical context surfaced by the clinic's qualifying questions (see the Protocols section of the Knowledge Base) — but only capture what the caller volunteers; do not press for medical details beyond what's needed for triage."""
 
 
 def build_first_message(clinic_name: str) -> str:
@@ -56,48 +74,124 @@ def _format_script_sections(script_sections: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
+def _instantiate_capabilities(
+    clinic: dict,
+    enabled_capability_ids: list[str],
+) -> list[Capability]:
+    """
+    Build the ordered list of Capability instances for this clinic.
+
+    Order:
+      1. Toggleable capabilities (in CAPABILITY_REGISTRY declaration order) —
+         only those whose ID is in enabled_capability_ids AND whose
+         supported_pms includes this clinic's pms_type.
+      2. Always-on capabilities (e.g. SubmitTicket) appended last so the
+         "closing & ticket submission" block is at the end of the prompt's
+         booking-protocols flow.
+
+    Capabilities incompatible with the clinic's pms_type are skipped with a
+    warning (the hypervisor should have refused the toggle at PUT time, so
+    hitting this is a data-drift safety net).
+    """
+    enabled = set(enabled_capability_ids)
+    instantiated: list[Capability] = []
+
+    # Toggleable first, in registry order
+    for cap_id, cls in CAPABILITY_REGISTRY.items():
+        if cls.always_on:
+            continue
+        if cap_id not in enabled:
+            continue
+        try:
+            instantiated.append(cls(clinic, _VAPI_CREDENTIAL_ID))
+        except ValueError as e:
+            log.warning(
+                "Skipping enabled capability %s for clinic_id=%s: %s",
+                cap_id, clinic.get("clinic_id"), e,
+            )
+
+    # Always-on last
+    for cls in CAPABILITY_REGISTRY.values():
+        if not cls.always_on:
+            continue
+        try:
+            instantiated.append(cls(clinic, _VAPI_CREDENTIAL_ID))
+        except ValueError as e:
+            # An always-on capability that refuses this clinic is a spec bug
+            # — e.g. SubmitTicket's supported_pms doesn't cover this PMS.
+            raise RuntimeError(
+                f"Always-on capability {cls.__name__} refused clinic: {e}"
+            ) from e
+
+    # Defense-in-depth: every assistant must have submit_ticket.
+    if not any(isinstance(c, SubmitTicket) for c in instantiated):
+        raise RuntimeError(
+            "No SubmitTicket capability instantiated — assistant cannot persist call outcomes."
+        )
+
+    return instantiated
+
+
+def _build_booking_protocols(caps: list[Capability]) -> str:
+    """
+    Compose the BOOKING PROTOCOLS section of the system prompt from capability
+    fragments + the universal Information Capture block.
+
+    Layout:
+      <toggleable cap fragments, in instantiation order>
+      <Information Capture — universal>
+      <always-on cap fragments, in instantiation order>
+
+    The always-on fragments come last because SubmitTicket's fragment is the
+    "Closing & Ticket Submission" block — it belongs at the end of the flow.
+    """
+    toggleable_fragments = [c.prompt_fragment for c in caps if not c.always_on]
+    always_on_fragments = [c.prompt_fragment for c in caps if c.always_on]
+    parts = toggleable_fragments + [_INFORMATION_CAPTURE_FRAGMENT] + always_on_fragments
+    return "\n\n".join(parts)
+
+
 def build_system_prompt(
     clinic: dict,
     faqs: list,
     script_sections: dict[str, str],
-    pms_type: str,
+    capabilities: list[Capability],
 ) -> str:
-    has_patient_match = pms_type == "blueprint"
+    """
+    Assemble the voice agent system prompt.
 
+    The prompt is split into two explicitly-labeled parts:
+
+      KNOWLEDGE BASE — clinic-specific, compiled/curated:
+        clinic metadata, the four approved script sections, and approved FAQs.
+        Descriptive — what the clinic does and how it talks to callers.
+
+      BOOKING PROTOCOLS — procedural, composed from enabled capabilities:
+        the agent's operational playbook — which tools are available, when to
+        use them, and how to close the call.
+
+    These are intentionally separate. The knowledge base must never contain
+    booking procedure; the booking protocols must not inline clinic facts.
+    """
     script_block = _format_script_sections(script_sections)
-
-    if has_patient_match:
-        patient_flow = """
-## Patient Identification Flow
-1. Early in the call, ask whether the caller has been to the clinic before.
-2. If yes:
-   a. Collect their first and last name.
-   b. Ask for the last 4 digits of the phone number on file.
-   c. Call `match_patient_by_name` with those three fields.
-   d. If the result is `matched`, note the returned `patient_id` for the ticket.
-   e. If the result is `ambiguous`, ask for the caller's date of birth and retry with the `dob` field.
-   f. If the result is `unmatched` after your best effort, treat the caller as new and ask for a callback phone number.
-3. If no: treat as a new patient — collect full name and callback phone number directly.
-
-You never learn the patient's full record — only a yes/no/ambiguous status and an opaque patient_id. Never pretend you know details about a patient beyond what the caller has told you directly.
-"""
-    else:
-        patient_flow = """
-## Patient Identification Flow
-This clinic does not have electronic patient lookup enabled. Collect the caller's full name and callback phone number directly, and record whether they state they are a new or existing patient in the ticket.
-"""
-
-    faqs_block = (
-        "## Frequently Asked Questions (reference)\n"
-        "These answers are curated by the clinic for common caller questions. "
-        "They are reference material only — if any FAQ conflicts with the Script "
-        "above, the Script is authoritative.\n\n"
-        f"{json.dumps(faqs or [], indent=2)}"
-    )
+    faqs_block = json.dumps(faqs or [], indent=2)
+    booking_protocols = _build_booking_protocols(capabilities)
 
     return f"""The date today is {datetime.datetime.now().strftime("%Y-%m-%d")}.
 
 You are the friendly, professional receptionist at {clinic["clinic_name"]}. Your job is to identify the caller's need, triage against the clinic's scope of practice, collect the information needed for follow-up, and create a ticket that clinic staff will use to call the patient back. Be empathetic when callers express frustration or distress about hearing difficulties — you are often the first voice they reach when they are already stressed.
+
+This prompt has TWO distinct parts:
+
+  1. KNOWLEDGE BASE — clinic-specific facts about what this clinic does and how
+     it talks to callers. Use it to answer questions, triage needs, and match
+     the clinic's voice. Descriptive, NOT procedural.
+  2. BOOKING PROTOCOLS — your operational playbook. Procedural. Follow it
+     consistently on every call, regardless of what the Knowledge Base says.
+
+========================================================================
+# KNOWLEDGE BASE
+========================================================================
 
 ## About the Clinic
 - Name: {clinic["clinic_name"]}
@@ -112,19 +206,26 @@ You are the friendly, professional receptionist at {clinic["clinic_name"]}. Your
 - Saturday: {clinic.get("hours_saturday", "Unknown")}
 - Sunday: {clinic.get("hours_sunday", "Unknown")}
 
-# Script (Authoritative)
-The following is the clinic's approved script. Treat it as the source of truth for what this clinic does, does not do, which caller needs you handle, and the step-by-step protocols you follow. If any FAQ below conflicts with this script, the script wins.
+## Approved Script (authoritative)
+Treat this as the source of truth for what this clinic does, does not do, who calls, and how the clinic talks to callers. If an FAQ below conflicts with this script, the script wins.
 
 {script_block}
 
-{patient_flow}
-
-## Ending the Call
-Before hanging up, call `submit_ticket` exactly once with a complete summary of the call. The ticket is how clinic staff know to follow up — if you do not submit it, the call is effectively lost.
+## Frequently Asked Questions (reference only)
+Curated by the clinic for common caller questions. Reference material — script wins on conflict.
 
 {faqs_block}
 
-## Behaviour Guidelines
+========================================================================
+# BOOKING PROTOCOLS
+========================================================================
+This is YOUR operational playbook — how you handle a call end-to-end. It is the same on every call, regardless of clinic. Do not improvise a different flow even if the Knowledge Base above seems to suggest one; the Knowledge Base is descriptive, this section is procedural.
+
+{booking_protocols}
+
+========================================================================
+# BEHAVIOUR GUIDELINES
+========================================================================
 - Be warm, concise, and professional.
 - Do not invent information about services, pricing, availability, or patient records. If you do not know, say so and offer to collect the caller's details for a callback.
 - Do not disclose internal identifiers (clinic_id, patient_id, etc.) to the caller.
@@ -133,45 +234,33 @@ Before hanging up, call `submit_ticket` exactly once with a complete summary of 
 """
 
 
-def _build_tools(pms_type: str, clinic_id: str) -> list[dict]:
-    """
-    Select tools based on clinic.pms_type.
-
-    - "blueprint": server-side patient match + ticket submission.
-    - other: ticket submission only (no PHI source available for matching).
-    """
-    if pms_type == "blueprint":
-        return [
-            make_match_patient_tool(clinic_id),
-            make_submit_ticket_tool(clinic_id),
-        ]
-    return [make_submit_ticket_tool(clinic_id)]
-
-
 def build_agent_config(
     clinic: dict,
     faqs: list,
     script_sections: dict[str, str],
+    enabled_capability_ids: list[str],
 ) -> dict:
     """
     Returns a complete VAPI assistant creation payload for the given clinic.
 
     Args:
-        clinic:          Clinic row from Users.clinics (must include clinic_name,
-                         clinic_id, address, hours_*, pms_type).
-        faqs:            List of {question, answer} from ClinicData.faq
-                         (pre-filtered to voice_assistant = TRUE).
-        script_sections: {section_name: content} — latest approved rows for all
-                         four sections. Missing any raises KeyError.
+        clinic:                 Clinic row from Users.clinics (must include
+                                clinic_name, clinic_id, address, hours_*, pms_type).
+        faqs:                   List of {question, answer} from ClinicData.faq
+                                (pre-filtered to voice_assistant = TRUE).
+        script_sections:        {section_name: content} — latest approved rows
+                                for all four sections. Missing any raises KeyError.
+        enabled_capability_ids: List of capability IDs from
+                                Users.clinic_voice_agent_capabilities where
+                                enabled=TRUE. Always-on capabilities (e.g.
+                                submit_ticket) are always attached regardless.
 
     Returns:
         Dict suitable for passing as kwargs to client.assistants.create().
     """
-    pms_type = clinic.get("pms_type", "none")
-    clinic_id = clinic["clinic_id"]
-
-    system_prompt = build_system_prompt(clinic, faqs, script_sections, pms_type)
-    tools = _build_tools(pms_type, clinic_id)
+    caps = _instantiate_capabilities(clinic, enabled_capability_ids)
+    system_prompt = build_system_prompt(clinic, faqs, script_sections, caps)
+    tools = [cap.to_vapi_tool() for cap in caps]
 
     model_config = {
         "provider": "openai",
@@ -185,10 +274,7 @@ def build_agent_config(
         "first_message": build_first_message(clinic["clinic_name"]),
         "first_message_interruptions_enabled": True,
         "model": model_config,
-        # VAPI requires voice + transcriber to be set explicitly before an
-        # assistant can be published. Defaults below; override per-clinic later
-        # if we want different voices.
-        "voice": {"provider": "11labs", "voiceId": "burt"},
+        "voice": {"speed": 0.9, "provider": "vapi", "voiceId": "Emma"},
         "transcriber": {"provider": "deepgram", "model": "nova-2", "language": "en-US"},
     }
 

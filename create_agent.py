@@ -17,10 +17,14 @@ from bigquery_client import run_query
 from google.cloud import bigquery
 from vapi_client import client
 from agent_factory import build_agent_config, SECTION_ORDER
+from capabilities import CAPABILITY_REGISTRY
 
 
 
-def fetch_clinic(clinic_name: str) -> dict:
+def fetch_clinic(clinic_name) -> dict:
+
+
+
     rows = run_query(
         """
         SELECT clinic_name, address, hours_monday, hours_tuesday, hours_wednesday,
@@ -79,6 +83,25 @@ def fetch_script_sections(clinic_id: str) -> dict[str, str]:
     return sections
 
 
+def fetch_enabled_capabilities(clinic_id: str) -> list[str]:
+    """
+    Return the list of capability IDs enabled for this clinic.
+
+    Silently drops IDs that aren't in CAPABILITY_REGISTRY (stale rows from a
+    capability that was renamed/removed in code). Always-on capabilities are
+    attached by agent_factory regardless, so missing rows for them are fine.
+    """
+    rows = run_query(
+        """
+        SELECT capability_id
+        FROM `project-demo-2-482101.Users.clinic_voice_agent_capabilities`
+        WHERE clinic_id = @clinic_id AND enabled = TRUE
+        """,
+        params=[bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id)],
+    )
+    return [r["capability_id"] for r in rows if r["capability_id"] in CAPABILITY_REGISTRY]
+
+
 def fetch_assistant(clinic_name: str):
     assistants = client.assistants.list()
     return next((a for a in assistants if a.name == clinic_name), None)
@@ -91,8 +114,9 @@ def sync_assistant(clinic_name: str):
 
     faqs = fetch_faqs(clinic_id)
     script_sections = fetch_script_sections(clinic_id)
+    enabled_capability_ids = fetch_enabled_capabilities(clinic_id)
 
-    config = build_agent_config(clinic, faqs, script_sections)
+    config = build_agent_config(clinic, faqs, script_sections, enabled_capability_ids)
 
     existing = fetch_assistant(clinic_name)
     if existing is not None:
@@ -106,5 +130,5 @@ def sync_assistant(clinic_name: str):
 
 
 if __name__ == "__main__":
-    clinic_name = "Audiology Clinic of Northern Alberta"
+    clinic_name = "Audiology Clinic of Northern Alberta" #ACNA
     sync_assistant(clinic_name)
